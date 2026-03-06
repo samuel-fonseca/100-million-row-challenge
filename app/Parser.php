@@ -51,9 +51,35 @@ final class Parser
         }
 
         $urlMap = [];
+        $bufferSize = 8 * 1024 * 1024;
+        $bytesRead = 0;
+        $chunkLength = $end - ftell($handle);
+        $leftover = '';
 
-        while (ftell($handle) < $end && ($line = fgets($handle)) !== false) {
-            $this->parseCsvRow($urlMap, $line);
+        while ($bytesRead < $chunkLength) {
+            $readSize = min($bufferSize, $chunkLength - $bytesRead);
+            $chunk = fread($handle, $readSize);
+
+            if ($chunk === false || $chunk === '') {
+                break;
+            }
+
+            $bytesRead += strlen($chunk);
+
+            $this->readChunk(
+                urlMap: $urlMap,
+                chunk: $chunk,
+                leftover: $leftover,
+            );
+        }
+
+        if ($leftover !== '') {
+            $rest = fgets($handle);
+            if($rest !== false) {
+                $leftover .= rtrim($rest, "\r\n");
+            }
+
+            $this->parseCsvRow($urlMap, $leftover);
         }
 
         $tempPath = sprintf('%s/../data/p%s_worker.json', __DIR__, $index);
@@ -63,12 +89,33 @@ final class Parser
         exit;
     }
 
+    private function readChunk(array &$urlMap, string $chunk, string &$leftover): void {
+        $data = $leftover.$chunk;
+        $dataLen = strlen($data);
+        $offset = 0;
+
+        while(($newLine = strpos($data, "\n", $offset)) !== false) {
+            $line = substr($data, $offset, $newLine - $offset);
+
+            if ($line !== '' && $line[-1] === "\r") {
+                $line = substr($line, 0, -1);
+            }
+
+            if ($line !== '') {
+                $this->parseCsvRow($urlMap, $line);
+            }
+
+            $offset = $newLine + 1;
+        }
+
+        $leftover = $offset < $dataLen ? substr($data, $offset) : '';
+    }
+
     private function parseCsvRow(array &$map, string $line): void
     {
-        [$url, $timestamp] = explode(',', $line, 2);
-
-        $urlPath = substr($url, strpos($url, '/', 8));
-        $datePath = substr($timestamp, 0, 10);
+        $commaPosition = strpos($line, ',');
+        $urlPath = substr($line, 19, $commaPosition - 19);
+        $datePath = substr($line, $commaPosition + 1, 10);
 
         $map[$urlPath][$datePath] = ($map[$urlPath][$datePath] ?? 0) + 1;
     }
