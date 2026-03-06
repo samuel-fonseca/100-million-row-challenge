@@ -2,11 +2,52 @@
 
 namespace App;
 
+use App\Commands\Visit;
 use RuntimeException;
+
+use function array_fill;
+use function array_slice;
+use function array_values;
+use function count;
+use function fclose;
+use function fgets;
+use function file_get_contents;
+use function file_put_contents;
+use function filesize;
+use function fopen;
+use function fread;
+use function fseek;
+use function ftell;
+use function intdiv;
+use function json_encode;
+use function min;
+use function pack;
+use function pcntl_fork;
+use function pcntl_waitpid;
+use function rtrim;
+use function shell_exec;
+use function sprintf;
+use function strlen;
+use function strpos;
+use function substr;
+use function unlink;
+use function unpack;
 
 final class Parser
 {
     private int $availableWorkers = 8;
+
+    private const NUM_DATE_SLOTS = 3328;
+
+    private array $urlToIndex = [];
+
+    private array $indexToUrl = [];
+
+    private int $flatMapSize;
+
+    private array $encounterOrder = [];
+
+    private array $seen = [];
 
     public function parse(string $inputPath, string $outputPath): void
     {
@@ -21,6 +62,7 @@ final class Parser
             }
 
             if ($pid === 0) {
+                $this->builUrlVisitsMap();
                 $this->processChunk($inputPath, $i);
                 exit;
             }
@@ -50,7 +92,7 @@ final class Parser
             fgets($handle);
         }
 
-        $urlMap = [];
+        $urlMap = array_fill(0, $this->flatMapSize, 0);
         $bufferSize = 8 * 1024 * 1024;
         $bytesRead = 0;
         $chunkLength = $end - ftell($handle);
@@ -82,11 +124,24 @@ final class Parser
             $this->parseCsvRow($urlMap, $leftover);
         }
 
-        $tempPath = sprintf('%s/../data/p%s_worker.json', __DIR__, $index);
-        file_put_contents($tempPath, serialize($urlMap));
+        $this->writeWorkerChunk($index, $urlMap);
         fclose($handle);
 
         exit;
+    }
+
+    private function writeWorkerChunk(int $index, array $map): void
+    {
+        $tempPath = sprintf('%s/../tmp/p%s_worker.bin', __DIR__, $index);
+        $n = count($this->encounterOrder);
+        $binary = pack('V', $n);
+        if ($n > 0) {
+            $binary .= pack('V*', ...$this->encounterOrder);
+        }
+        for ($i = 0; $i < $this->flatMapSize; $i += 5000) {
+            $binary .= pack('V*', ...array_slice($map, $i, 5000));
+        }
+        file_put_contents($tempPath, $binary);
     }
 
     private function readChunk(array &$urlMap, string $chunk, string &$leftover): void {
@@ -113,38 +168,91 @@ final class Parser
 
     private function parseCsvRow(array &$map, string $line): void
     {
-        $commaPosition = strpos($line, ',');
-        $urlPath = substr($line, 19, $commaPosition - 19);
-        $datePath = substr($line, $commaPosition + 1, 10);
+        $urlPath = substr($line, 19, -26);
+        $urlIndex = $this->urlToIndex[$urlPath];
 
-        $map[$urlPath][$datePath] = ($map[$urlPath][$datePath] ?? 0) + 1;
+        if (!isset($this->seen[$urlIndex])) {
+            $this->seen[$urlIndex] = true;
+            $this->encounterOrder[] = $urlIndex;
+        }
+
+        $datePosition = strlen($line) - 25;
+        $dateIndex = ((int) substr($line, $datePosition, 4) - 2020) * 416
+                   + (int) substr($line, $datePosition + 5, 2) * 32
+                   + (int) substr($line, $datePosition + 8, 2);
+
+        $map[$urlIndex * self::NUM_DATE_SLOTS + $dateIndex]++;
     }
 
     private function mergeOutputChunks(string $outputPath): void
     {
-        $merged = [];
+        $urls = Visit::all();
+        [$merged, $urlOrder] = $this->mergeWorkerFiles(count($urls));
+        $output = $this->buildOutput($urls, $merged, $urlOrder);
+        file_put_contents($outputPath, json_encode($output, JSON_PRETTY_PRINT));
+    }
+
+    private function mergeWorkerFiles(int $numUrls): array
+    {
+        $flatMapSize = $numUrls * self::NUM_DATE_SLOTS;
+        $merged = array_fill(0, $flatMapSize, 0);
+        $urlOrder = [];
+        $urlSeen = [];
 
         for ($i = 0; $i < $this->availableWorkers; $i++) {
-            $tempPath = sprintf('%s/../data/p%s_worker.json', __DIR__, $i);
-            $partial = unserialize(file_get_contents($tempPath));
+            $tempPath = sprintf('%s/../tmp/p%s_worker.bin', __DIR__, $i);
+            $binary = file_get_contents($tempPath);
 
-            foreach ($partial as $urlPath => $dates) {
-                foreach ($dates as $date => $count) {
-                    $merged[$urlPath][$date] = ($merged[$urlPath][$date] ?? 0) + $count;
+            $n = unpack('V', $binary, 0)[1];
+            $headerSize = 4 + $n * 4;
+
+            for ($j = 0; $j < $n; $j++) {
+                $urlIndex = unpack('V', $binary, 4 + $j * 4)[1];
+                if (!isset($urlSeen[$urlIndex])) {
+                    $urlSeen[$urlIndex] = true;
+                    $urlOrder[] = $urlIndex;
                 }
+            }
+
+            $values = array_values(unpack("V{$flatMapSize}", $binary, $headerSize));
+            foreach ($values as $j => $value) {
+                $merged[$j] += $value;
             }
 
             unlink($tempPath);
         }
 
-        foreach ($merged as &$dates) {
-            ksort($dates);
+        return [$merged, $urlOrder];
+    }
+
+    private function buildOutput(array $urls, array $merged, array $urlOrder): array
+    {
+        $output = [];
+
+        foreach ($urlOrder as $index) {
+            $base = $index * self::NUM_DATE_SLOTS;
+
+            for ($di = 0; $di < self::NUM_DATE_SLOTS; $di++) {
+                $count = $merged[$base + $di];
+                if ($count === 0) continue;
+
+                $urlPath = substr($urls[$index]->uri, 19);
+                $dateStr = $this->slotToDateString($di);
+                $output[$urlPath][$dateStr] = $count;
+            }
         }
 
-        file_put_contents(
-            filename: $outputPath,
-            data: json_encode($merged, JSON_PRETTY_PRINT)
-        );
+        return $output;
+    }
+
+    private function slotToDateString(int $slot): string
+    {
+        $year = 2020 + intdiv($slot, 416);
+        $rem = $slot % 416;
+        $month = intdiv($rem, 32);
+        $day = $rem % 32;
+
+        return sprintf('%04d-%02d-%02d', $year, $month, $day);
     }
 
     private function getCoreCount(): int
@@ -156,5 +264,19 @@ final class Parser
         };
 
         return $cores > 0 ? $cores : 4;
+    }
+
+    private function builUrlVisitsMap(): void
+    {
+        $urls = Visit::all();
+
+        foreach ($urls as $i => $visit) {
+            $path = substr($visit->uri, 19);
+            $this->urlToIndex[$path] = $i;
+            $this->indexToUrl[$i] = $path;
+        }
+
+        $numUrls = count($urls);
+        $this->flatMapSize = $numUrls * self::NUM_DATE_SLOTS;
     }
 }
